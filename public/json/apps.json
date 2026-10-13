@@ -17,6 +17,11 @@
         "url": "/ai"
     },
     {
+        "name": "Gemini Chat",
+        "icon": "/img/icons/gemini.svg",
+        "url": "/gemini"
+    },
+    {
         "name": "App Store",
         "icon": "/img/icons/appstore.webp",
         "url": "/appstore"
