@@ -1,4 +1,10 @@
 import dummyProxy, { swReady } from "./encoding";
+import {
+    isAuthUrl,
+    interceptAuthNavigation,
+    openAuthPopup,
+    installIframeAuthHooks,
+} from "./oauth-popup";
 
 // --- Site Alert Logic ---
 let siteAlerts: any[] = [];
@@ -101,6 +107,8 @@ class Tab {
     iframe: HTMLIFrameElement | null = null;
     isActive: boolean;
     hasIframe: boolean = false;
+    /** Last non-auth URL loaded in this tab; used to restore after an OAuth popup. */
+    lastSafeUrl: string = '';
 
     element: HTMLElement | null = null;
     isDragging: boolean = false;
@@ -134,6 +142,9 @@ class Tab {
 
         if (!this.iframe) {
             this.iframe = document.createElement('iframe');
+
+            // Divert OAuth/login navigations inside the iframe to a native popup
+            installIframeAuthHooks(this.iframe);
 
             this.iframe.src = this.getResolvedUrl();
         } else {
@@ -210,6 +221,12 @@ class TabManager {
                 } else {
                     destinationUrl = searchEngineUrl + addressInput.value;
                     finalUrl = dummyProxy.encodeUrl(destinationUrl);
+                }
+
+                // OAuth/login URLs open in a native popup, never in the iframe
+                if (!addressInput.value.startsWith('bolt://') && isAuthUrl(destinationUrl)) {
+                    openAuthPopup(destinationUrl);
+                    return;
                 }
 
                 this.updateActiveTabUrl(finalUrl);
@@ -531,6 +548,34 @@ class TabManager {
             iframe.onload = () => {
                 const addressInput = document.getElementById('address-input') as HTMLInputElement;
 
+                // --- OAuth/login popup interception ---
+                // If the proxied page tried to load an auth URL (accounts.google.com,
+                // ://apple.com, auth0.com), open it in a native popup instead and
+                // bounce the iframe back to the last safe page. When the popup is
+                // closed, the interceptor reloads the iframe so the site picks up
+                // the new session cookies.
+                try {
+                    const currentHref = iframe.contentWindow?.location.href;
+                    if (currentHref && currentHref !== 'about:blank' && isAuthUrl(currentHref)) {
+                        let restoreUrl =
+                            tab.lastSafeUrl && !isAuthUrl(tab.lastSafeUrl)
+                                ? tab.lastSafeUrl
+                                : tab.url;
+                        if (!restoreUrl || isAuthUrl(restoreUrl) || restoreUrl === currentHref) {
+                            restoreUrl = 'bolt://newtab';
+                        }
+
+                        if (interceptAuthNavigation(iframe, currentHref, restoreUrl)) {
+                            tab.url = restoreUrl;
+                            return;
+                        }
+                        // Popup blocked — fall through and let the iframe
+                        // display the login page as before.
+                    }
+                } catch (e) {
+                    // Ignore cross-origin errors
+                }
+
                 // Sync the tab's internal URL with the actual iframe location
                 try {
                     const currentHref = iframe.contentWindow?.location.href;
@@ -565,6 +610,16 @@ class TabManager {
                     }
                     addressInput.value = displayUrl;
                     checkForSiteAlerts(displayUrl);
+                }
+
+                // Remember the last non-auth page for post-popup restore/reload
+                try {
+                    const hrefNow = iframe.contentWindow?.location.href;
+                    if (hrefNow && hrefNow !== 'about:blank' && !isAuthUrl(hrefNow)) {
+                        tab.lastSafeUrl = hrefNow;
+                    }
+                } catch (e) {
+                    // Ignore cross-origin errors
                 }
             }
 
@@ -609,6 +664,12 @@ function navigateTo(url: string) {
         newUrl = 'https://' + url;
     } else {
         newUrl = searchEngineUrl + url;
+    }
+
+    // OAuth/login URLs open in a native popup, never in the proxy iframe
+    if (isAuthUrl(newUrl)) {
+        openAuthPopup(newUrl);
+        return;
     }
 
     myBrowser.updateActiveTabUrl(dummyProxy.encodeUrl(newUrl));

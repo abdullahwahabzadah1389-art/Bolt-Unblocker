@@ -51,6 +51,22 @@ export const swReady = new Promise<void>((resolve) => {
     }
 });
 
+// Identify this window to the service worker as a main-application client.
+// The SW loads accounts.google.com natively only for tagged clients, so the
+// OAuth interceptor's proxied popup windows (which never run this script)
+// keep their traffic inside the proxy pipeline.
+function tagServiceWorkerClient() {
+    navigator.serviceWorker?.controller?.postMessage({ type: 'bolt:tag-client' });
+}
+
+swReady.then(tagServiceWorkerClient);
+
+navigator.serviceWorker?.addEventListener('message', (event) => {
+    if (event.data && event.data.type === 'bolt:request-tag') {
+        tagServiceWorkerClient();
+    }
+});
+
 const bmc = new BareMuxConnection("/baremux/worker.js");
 (async () => {
     if (!await bmc.getTransport()) {
