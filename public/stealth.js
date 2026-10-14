@@ -201,7 +201,9 @@
     } catch (e) { /* leave native */ }
 
     // ------------------------------------------------------------------
-    // 2b. Object.getOwnPropertyNames -> hide proxy-injected window props
+    // 2b. Common global object queries -> hide proxy-injected window props
+    //     and report authentic native signatures, so runtime inspection of
+    //     window/global matches an unmodified browser stack.
     // ------------------------------------------------------------------
     var baselineWindowNames = {};
     try {
@@ -211,29 +213,102 @@
 
     var PROXY_PROP = /\$scramjet|scramjet|__uv|uv\$|Ultraviolet|bareMux|wisp/i;
 
-    var stealthGetOwnPropertyNames = function getOwnPropertyNames(obj) {
-        var names = nativeGetOwnPropertyNames.call(Object, obj);
-        if (obj !== window && !(typeof Window !== "undefined" && obj instanceof Window)) {
-            return names;
-        }
+    /** A window own-prop added after load that identifies the proxy. */
+    function isProxyWindowProp(name) {
+        return !baselineWindowNames[name] && PROXY_PROP.test(name);
+    }
+
+    /** Drops proxy-injected own-property names, keeping genuine browser props. */
+    function hideProxyWindowProps(names) {
         var out = [];
         for (var k = 0; k < names.length; k++) {
-            var name = names[k];
-            if (!baselineWindowNames[name] && PROXY_PROP.test(name)) continue;
-            out.push(name);
+            if (isProxyWindowProp(names[k])) continue;
+            out.push(names[k]);
         }
         return out;
+    }
+
+    /** True for the window/global object (the only one we filter). */
+    function isWindowLike(obj) {
+        return obj === window || (typeof Window !== "undefined" && obj instanceof Window);
+    }
+
+    // Natives captured before any patching below, so the wrappers delegate
+    // without re-entering themselves.
+    var nativeGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
+    var nativeGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+    var nativeGetOwnPropertySymbols = Object.getOwnPropertySymbols;
+    var nativeReflectOwnKeys = Reflect.ownKeys;
+
+    var stealthGetOwnPropertyNames = function getOwnPropertyNames(obj) {
+        var names = nativeGetOwnPropertyNames.call(Object, obj);
+        if (!isWindowLike(obj)) return names;
+        return hideProxyWindowProps(names);
     };
     hooked.add(stealthGetOwnPropertyNames);
 
-    try {
-        nativeDefineProperty(Object, "getOwnPropertyNames", {
-            value: stealthGetOwnPropertyNames,
-            writable: true,
-            enumerable: false,
-            configurable: true,
-        });
-    } catch (e) { /* leave native */ }
+    var stealthGetOwnPropertySymbols = function getOwnPropertySymbols(obj) {
+        var syms = nativeGetOwnPropertySymbols.call(Object, obj);
+        if (!isWindowLike(obj)) return syms;
+        var out = [];
+        for (var s = 0; s < syms.length; s++) {
+            var desc = syms[s] && syms[s].description;
+            if (desc && PROXY_PROP.test(desc)) continue;
+            out.push(syms[s]);
+        }
+        return out;
+    };
+    hooked.add(stealthGetOwnPropertySymbols);
+
+    var stealthGetOwnPropertyDescriptors = function getOwnPropertyDescriptors(obj) {
+        var descs = nativeGetOwnPropertyDescriptors.call(Object, obj);
+        if (!isWindowLike(obj)) return descs;
+        var keys = Object.keys(descs);
+        for (var d = 0; d < keys.length; d++) {
+            if (isProxyWindowProp(keys[d])) delete descs[keys[d]];
+        }
+        return descs;
+    };
+    hooked.add(stealthGetOwnPropertyDescriptors);
+
+    var stealthGetOwnPropertyDescriptor = function getOwnPropertyDescriptor(obj, prop) {
+        if (isWindowLike(obj) && typeof prop === "string" && isProxyWindowProp(prop)) {
+            return undefined;
+        }
+        return nativeGetOwnPropertyDescriptor.call(Object, obj, prop);
+    };
+    hooked.add(stealthGetOwnPropertyDescriptor);
+
+    var stealthOwnKeys = function ownKeys(obj) {
+        var keys = nativeReflectOwnKeys.call(Reflect, obj);
+        if (!isWindowLike(obj)) return keys;
+        var out = [];
+        for (var i = 0; i < keys.length; i++) {
+            var key = keys[i];
+            if (typeof key === "string" && isProxyWindowProp(key)) continue;
+            out.push(key);
+        }
+        return out;
+    };
+    hooked.add(stealthOwnKeys);
+
+    /** Installs a native-reported value, skipping any the engine refuses. */
+    function installNative(target, name, value) {
+        try {
+            nativeDefineProperty(target, name, {
+                value: value,
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            });
+        } catch (e) { /* leave native */ }
+    }
+
+    installNative(Object, "getOwnPropertyNames", stealthGetOwnPropertyNames);
+    installNative(Object, "getOwnPropertySymbols", stealthGetOwnPropertySymbols);
+    installNative(Object, "getOwnPropertyDescriptors", stealthGetOwnPropertyDescriptors);
+    installNative(Object, "getOwnPropertyDescriptor", stealthGetOwnPropertyDescriptor);
+    installNative(Reflect, "ownKeys", stealthOwnKeys);
 
     // ------------------------------------------------------------------
     // 3. accounts.google.com hardening
@@ -246,10 +321,14 @@
         }
     }
 
-    /** Creates an anonymous (name-blanked) function reported as native. */
-    function anon(fn) {
+    /**
+     * Creates a function reported as native, stamped with its authentic name so
+     * `fn.toString()` reads `function <name>() { [native code] }` — matching an
+     * unmodified Chrome's own chrome.* APIs instead of an anonymous stub.
+     */
+    function anon(fn, name) {
         try {
-            nativeDefineProperty(fn, "name", { value: "", configurable: true });
+            nativeDefineProperty(fn, "name", { value: name || "", configurable: true });
         } catch (e) { /* keep inferred name */ }
         hooked.add(fn);
         return fn;
@@ -278,12 +357,12 @@
                 chromeObj.runtime = {
                     connect: anon(function () {
                         return {
-                            onMessage: { addListener: anon(function () { }) },
-                            postMessage: anon(function () { }),
-                            disconnect: anon(function () { }),
+                            onMessage: { addListener: anon(function () { }, "addListener") },
+                            postMessage: anon(function () { }, "postMessage"),
+                            disconnect: anon(function () { }, "disconnect"),
                         };
-                    }),
-                    sendRequest: anon(function () { return false; }),
+                    }, "connect"),
+                    sendRequest: anon(function () { return false; }, "sendRequest"),
                     id: undefined,
                 };
             }
@@ -305,23 +384,23 @@
                         requestTime: now - 0.1,
                         startLoadTime: now - 0.08,
                     };
-                });
+                }, "loadTimes");
             }
 
             if (typeof chromeObj.csi !== "function") {
                 chromeObj.csi = anon(function () {
                     var now = Date.now();
                     return { startE: now - 800, onloadT: now, pageT: 1200, tran: 15 };
-                });
+                }, "csi");
             }
 
             if (!chromeObj.app) {
                 chromeObj.app = {
                     isInstalled: false,
-                    getDetails: anon(function () { return null; }),
-                    getIsInstalled: anon(function () { return false; }),
-                    installState: anon(function () { }),
-                    runningState: anon(function () { return "cannot_run"; }),
+                    getDetails: anon(function () { return null; }, "getDetails"),
+                    getIsInstalled: anon(function () { return false; }, "getIsInstalled"),
+                    installState: anon(function () { }, "installState"),
+                    runningState: anon(function () { return "cannot_run"; }, "runningState"),
                 };
             }
 

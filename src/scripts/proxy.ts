@@ -1,12 +1,14 @@
-import { BareMuxConnection } from '@mercuryworkshop/bare-mux';
+import { BareMuxConnection } from '@mercuryworkshop/bare-mux';// InvisiProxy v8 primary network hook.
+// LibcurlTransport is the single network path for every proxied request — the
+// window, the Ultraviolet/Scramjet workers, and the raw accounts.google.com
+// auth fallback in public/sw.js all share this one bare-mux channel, so the
+// `setTransport` call below is the only place the transport is selected.
+const PRIMARY_TRANSPORT = "/libcurl/index.mjs";
 
-// temp: change default to lib
 const wispUrl = (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/wisp/";
 const bareUrl = (location.protocol === "https:" ? "https" : "http") + "://" + location.host + "/bare/";
 
 
-
-var transport = "/libcurl/index.mjs";
 const { ScramjetController } = typeof $scramjetLoadController !== 'undefined' ? $scramjetLoadController() : {
     ScramjetController: class {
         init() { }
@@ -14,9 +16,6 @@ const { ScramjetController } = typeof $scramjetLoadController !== 'undefined' ? 
     } as any
 };
 
-if (localStorage.getItem('transport') === 'lib') {
-    transport = '/libcurl/index.mjs';
-}
 
 const scramjet = new ScramjetController({
     files: {
@@ -51,26 +50,14 @@ export const swReady = new Promise<void>((resolve) => {
     }
 });
 
-// Identify this window to the service worker as a main-application client.
-// The SW loads accounts.google.com natively only for tagged clients, so the
-// OAuth interceptor's proxied popup windows (which never run this script)
-// keep their traffic inside the proxy pipeline.
-function tagServiceWorkerClient() {
-    navigator.serviceWorker?.controller?.postMessage({ type: 'bolt:tag-client' });
-}
-
-swReady.then(tagServiceWorkerClient);
-
-navigator.serviceWorker?.addEventListener('message', (event) => {
-    if (event.data && event.data.type === 'bolt:request-tag') {
-        tagServiceWorkerClient();
-    }
-});
-
 const bmc = new BareMuxConnection("/baremux/worker.js");
 (async () => {
-    if (!await bmc.getTransport()) {
-        await bmc.setTransport(transport, [{ wisp: wispUrl }]);
+    // Install the primary network hook whenever nothing is selected yet or the
+    // active transport is not the primary, so a stale/foreign transport can
+    // never become the network path. Idempotent for the common case.
+    const active = await bmc.getTransport();
+    if (!active || active.indexOf("libcurl") === -1) {
+        await bmc.setTransport(PRIMARY_TRANSPORT, [{ wisp: wispUrl }]);
     }
 })();
 

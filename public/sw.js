@@ -10,6 +10,9 @@ importScripts("/math/uv.bundle.js");
 importScripts("/math/uv.config.js");
 importScripts("/math/uv.sw.js");
 importScripts("/learn/scramjet.all.js");
+// InvisiProxy v8: bare-mux client backing the raw transport fallback used for
+// accounts.google.com (mounted at /baremux/ by app.js and the dev server).
+importScripts("/baremux/index.js");
 
 const { ScramjetServiceWorker } = $scramjetLoadWorker();
 const uv = new UVServiceWorker(self.__uv$config);
@@ -190,26 +193,114 @@ async function maybeInjectStealth(request, response) {
     }
 }
 
+// ---- InvisiProxy v8: raw transport for authentication endpoints -------------
+// When a request resolves to accounts.google.com it is relayed as a raw stream
+// over the primary bare-mux transport (LibcurlTransport, configured in
+// src/scripts/proxy.ts). No Ultraviolet/Scramjet wrapper, variable override, or
+// service-worker structural handler is injected into the document context —
+// only the DOM-masquerading layer (public/stealth.js) applied by
+// maybeInjectStealth, so runtime signatures match an unmodified browser while
+// the auth traffic stays tunneled behind this origin.
+const AUTH_HOST = "accounts.google.com";
+let rawTransportClient = null;
+
+function getRawTransportClient() {
+    if (!rawTransportClient && self.BareMux && self.BareMux.BareClient) {
+        rawTransportClient = new self.BareMux.BareClient();
+    }
+    return rawTransportClient || null;
+}
+
 /**
- * Window clients belonging to the main application (tagged via the
- * `bolt:tag-client` message from src/scripts/proxy.ts). OAuth popups spawned
- * by the interceptor never run app scripts, so they are NOT tagged and their
- * accounts.google.com navigations stay fully proxied.
+ * Resolves the true accounts.google.com target for a request, or null when the
+ * request is not part of the auth flow. Covers the auth document, its absolute
+ * accounts.google.com subresources, and its same-origin relative subresources
+ * (the raw document is served on this origin under
+ * /$/https://accounts.google.com/…, so relative URLs resolve here and are
+ * re-targeted to the auth host — no document rewriting involved).
  */
-const taggedClients = new Set();
+function authTargetFor(request) {
+    const direct = realTargetUrl(request.url);
+    if (direct && direct.hostname === AUTH_HOST) return direct;
+    try {
+        const u = new URL(request.url);
+        if (u.hostname === AUTH_HOST) return u;
+    } catch (e) { /* not parseable */ }
+
+    try {
+        if (request.mode === "navigate" || !request.referrer) return null;
+        const refTarget = realTargetUrl(request.referrer);
+        if (!refTarget || refTarget.hostname !== AUTH_HOST) return null;
+        const u = new URL(request.url);
+        if (u.origin !== self.location.origin) return null;
+        const uvPrefix = (self.__uv$config && self.__uv$config.prefix) || "/maths/";
+        const sjPrefix = (scramjet && scramjet.config && scramjet.config.prefix) || "/$/";
+        if (u.pathname.startsWith(uvPrefix) || u.pathname.startsWith(sjPrefix)) return null;
+        return new URL(u.pathname + u.search, "https://" + AUTH_HOST + "/");
+    } catch (e) { return null; }
+}
+
+/**
+ * Aligns the relayed request with what an unmodified browser sends directly to
+ * the auth host: transport-managed/hop-by-hop headers are dropped, and
+ * Origin/Referer/Sec-Fetch reflect a native same-origin request to
+ * accounts.google.com so the tunneled traffic matches a direct browser stack.
+ */
+function normalizeAuthHeaders(request, target, headers) {
+    for (const h of ["host", "connection", "content-length", "accept-encoding"]) {
+        headers.delete(h);
+    }
+    const isNav = request.mode === "navigate";
+    const hasBody = request.method !== "GET" && request.method !== "HEAD";
+
+    if (hasBody) headers.set("origin", target.origin);
+    else headers.delete("origin");
+
+    if (isNav && !hasBody) headers.delete("referer"); // fresh document load
+    else headers.set("referer", target.origin + "/");
+
+    if (isNav) {
+        headers.set("sec-fetch-site", hasBody ? "same-origin" : "none");
+        headers.set("sec-fetch-mode", "navigate");
+        headers.set("sec-fetch-user", "?1");
+        headers.set("sec-fetch-dest", "document");
+        headers.set("upgrade-insecure-requests", "1");
+    } else {
+        headers.set("sec-fetch-site", "same-origin");
+        headers.delete("sec-fetch-user");
+    }
+    return headers;
+}
+
+/** Relays a request to `target` as a raw transport stream (no rewriter layer). */
+async function fetchViaRawTransport(request, target) {
+    const client = getRawTransportClient();
+    if (!client) return null;
+    try {
+        const patched = await withMirroredCookies(request);
+        const headers = normalizeAuthHeaders(request, target, new Headers(patched.headers));
+        const init = { method: patched.method, headers, redirect: "manual" };
+        if (patched.method !== "GET" && patched.method !== "HEAD") {
+            init.body = await patched.clone().arrayBuffer();
+        }
+        return await client.fetch(target.href, init);
+    } catch (error) {
+        console.error("Raw auth transport failed:", error);
+        return null;
+    }
+}
 
 async function handleRequest(event) {
     try {
         await scramjet.loadConfig().catch(err => console.error("Scramjet Config Load Failed", err));
 
-        // Main-app clients load accounts.google.com natively: no
-        // Ultraviolet/Scramjet interception and no injected hooks. Requests
-        // from untagged clients (e.g. the proxied auth popup) stay proxied.
-        if (event.request.mode === "navigate" && taggedClients.has(event.clientId)) {
-            const navTarget = realTargetUrl(event.request.url);
-            if (navTarget && navTarget.hostname === "accounts.google.com") {
-                return Response.redirect(navTarget.href, 302);
-            }
+        // InvisiProxy v8: authentication endpoints use the raw transport only —
+        // never the Ultraviolet/Scramjet rewriters or their injected handlers.
+        const authTarget = authTargetFor(event.request);
+        if (authTarget) {
+            const raw = await fetchViaRawTransport(event.request, authTarget);
+            if (raw) return await maybeInjectStealth(event.request, raw);
+            // transport not ready — fall through to the normal proxy path
         }
 
         if (uv.route(event)) {
@@ -238,34 +329,12 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(handleRequest(event));
 });
 
-self.addEventListener("activate", (event) => {
-    // Client ids are lost when this worker restarts: ask every window client
-    // to re-tag itself so the accounts.google.com native-load gate keeps
-    // working without ever tagging auth popups.
-    const retag = self.clients
-        .matchAll({ type: "window", includeUncontrolled: true })
-        .then((cs) => {
-            for (const client of cs) client.postMessage({ type: "bolt:request-tag" });
-        })
-        .catch(() => { });
-    if (event.waitUntil) event.waitUntil(retag);
-});
-
 let playgroundData;
 self.addEventListener("message", (event) => {
     const data = event.data || {};
 
     if (data.type === "playgroundData") {
         playgroundData = data;
-        return;
-    }
-
-    // Main-app windows identify themselves so the accounts.google.com
-    // native-load gate applies to them (and their app iframes) only
-    if (data.type === "bolt:tag-client") {
-        if (event.source && event.source.id) {
-            taggedClients.add(event.source.id);
-        }
         return;
     }
 
